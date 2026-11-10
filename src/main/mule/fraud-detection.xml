@@ -1,0 +1,243 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:jms="http://www.mulesoft.org/schema/mule/jms"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+      http://www.mulesoft.org/schema/mule/core
+      http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+      http://www.mulesoft.org/schema/mule/jms
+      http://www.mulesoft.org/schema/mule/jms/current/mule-jms.xsd">
+
+    <flow name="fraud-detectionFlow">
+
+        <!-- CONSUME TRANSACTION -->
+        <jms:listener
+            config-ref="JMS_Config"
+            destination="txn.scoring.queue"
+            doc:name="Consume Transaction"/>
+
+        <logger level="INFO"
+            message="Received transaction: #[payload]"
+            doc:name="Log Received Transaction"/>
+
+        <set-payload
+            value="#[if (payload is String) read(payload, 'application/json') else payload]"
+            doc:name="Parse Transaction JSON"/>
+
+        <!-- INITIALIZE SCORING -->
+        <set-variable variableName="fraudScore"
+            value="#[0]"
+            doc:name="Initialize Fraud Score"/>
+
+        <set-variable variableName="ruleHits"
+            value="#[[]]"
+            doc:name="Initialize Rule Hits"/>
+
+        <!-- TEMPORARY MOCK CUSTOMER PROFILE -->
+        <set-variable variableName="customerProfile"
+            value="#[{
+                customerId: payload.customerId,
+                country: 'IN',
+                p99Amount: 50000,
+                dailyLimit: 100000,
+                usualStartHour: 8,
+                usualEndHour: 22,
+                knownMerchants: ['MERCHANT001'],
+                knownDevices: ['DEVICE001'],
+                deviceCountryHistory: ['IN']
+            }]"
+            doc:name="Mock Customer Profile"/>
+
+        <!-- TEMPORARY MOCK VELOCITY DATA -->
+        <set-variable variableName="velocityData"
+            value="#[{
+                transactionCount10Min: 2,
+                totalAmount24Hours: 25000
+            }]"
+            doc:name="Mock Velocity Data"/>
+
+        <!-- TEMPORARY CHANNEL CEILINGS -->
+        <set-variable variableName="channelCeilings"
+            value="#[{
+                ONLINE: 100000,
+                BRANCH: 100000,
+                ATM: 100000,
+                MOBILE: 100000
+            }]"
+            doc:name="Mock Channel Ceilings"/>
+
+        <!-- TEMPORARY TRANSACTION COUNT THRESHOLD -->
+        <set-variable variableName="maxTransactions10Min"
+            value="#[3]"
+            doc:name="Mock Transaction Count Limit"/>
+
+        <!-- MISSING DATA CHECK -->
+        <set-variable variableName="insufficientData"
+            value="#[vars.customerProfile == null or vars.velocityData == null]"
+            doc:name="Check Missing Customer or Velocity Data"/>
+
+        <!-- FR-001: AMOUNT ABOVE CUSTOMER 90-DAY P99 -->
+        <choice doc:name="Evaluate FR-001">
+            <when expression="#[not vars.insufficientData and payload.amount > vars.customerProfile.p99Amount]">
+                <set-variable variableName="fraudScore"
+                    value="#[vars.fraudScore + 25]"/>
+                <set-variable variableName="ruleHits"
+                    value="#[vars.ruleHits ++ ['FR-001']]"/>
+            </when>
+        </choice>
+
+        <!-- FR-002: AMOUNT ABOVE CHANNEL CEILING -->
+        <choice doc:name="Evaluate FR-002">
+            <when expression="#[not vars.insufficientData and payload.amount > (vars.channelCeilings[payload.channel] default 100000)]">
+                <set-variable variableName="fraudScore"
+                    value="#[vars.fraudScore + 30]"/>
+                <set-variable variableName="ruleHits"
+                    value="#[vars.ruleHits ++ ['FR-002']]"/>
+            </when>
+        </choice>
+
+        <!-- FR-003: TOO MANY TRANSACTIONS IN 10 MINUTES -->
+        <choice doc:name="Evaluate FR-003">
+            <when expression="#[not vars.insufficientData and vars.velocityData.transactionCount10Min > vars.maxTransactions10Min]">
+                <set-variable variableName="fraudScore"
+                    value="#[vars.fraudScore + 20]"/>
+                <set-variable variableName="ruleHits"
+                    value="#[vars.ruleHits ++ ['FR-003']]"/>
+            </when>
+        </choice>
+
+        <!-- FR-004: 24-HOUR SPENDING LIMIT EXCEEDED -->
+        <choice doc:name="Evaluate FR-004">
+            <when expression="#[not vars.insufficientData and vars.velocityData.totalAmount24Hours > vars.customerProfile.dailyLimit]">
+                <set-variable variableName="fraudScore"
+                    value="#[vars.fraudScore + 20]"/>
+                <set-variable variableName="ruleHits"
+                    value="#[vars.ruleHits ++ ['FR-004']]"/>
+            </when>
+        </choice>
+
+        <!-- FR-005: FIRST-SEEN MERCHANT -->
+        <choice doc:name="Evaluate FR-005">
+            <when expression="#[not vars.insufficientData and !(vars.customerProfile.knownMerchants contains payload.merchantId)]">
+                <set-variable variableName="fraudScore"
+                    value="#[vars.fraudScore + 15]"/>
+                <set-variable variableName="ruleHits"
+                    value="#[vars.ruleHits ++ ['FR-005']]"/>
+            </when>
+        </choice>
+
+        <!-- FR-006: MERCHANT COUNTRY MISMATCH -->
+        <choice doc:name="Evaluate FR-006">
+            <when expression="#[not vars.insufficientData and payload.merchantCountry != vars.customerProfile.country]">
+                <set-variable variableName="fraudScore"
+                    value="#[vars.fraudScore + 15]"/>
+                <set-variable variableName="ruleHits"
+                    value="#[vars.ruleHits ++ ['FR-006']]"/>
+            </when>
+        </choice>
+
+        <!-- FR-007: UNKNOWN DEVICE -->
+        <choice doc:name="Evaluate FR-007">
+            <when expression="#[not vars.insufficientData and !(vars.customerProfile.knownDevices contains payload.deviceId)]">
+                <set-variable variableName="fraudScore"
+                    value="#[vars.fraudScore + 15]"/>
+                <set-variable variableName="ruleHits"
+                    value="#[vars.ruleHits ++ ['FR-007']]"/>
+            </when>
+        </choice>
+
+        <!-- FR-008: IP COUNTRY DIFFERS FROM DEVICE HISTORY -->
+        <choice doc:name="Evaluate FR-008">
+            <when expression="#[not vars.insufficientData and !(vars.customerProfile.deviceCountryHistory contains payload.ipCountryCode)]">
+                <set-variable variableName="fraudScore"
+                    value="#[vars.fraudScore + 10]"/>
+                <set-variable variableName="ruleHits"
+                    value="#[vars.ruleHits ++ ['FR-008']]"/>
+            </when>
+        </choice>
+
+        <!-- FR-009: OUTSIDE USUAL ACTIVITY HOURS -->
+        <choice doc:name="Evaluate FR-009">
+           <when expression="#[not vars.insufficientData and (((payload.occurredAt default now()) as DateTime).hour &lt; vars.customerProfile.usualStartHour or ((payload.occurredAt default now()) as DateTime).hour > vars.customerProfile.usualEndHour)]">
+                <set-variable variableName="fraudScore"
+                    value="#[vars.fraudScore + 10]"/>
+                <set-variable variableName="ruleHits"
+                    value="#[vars.ruleHits ++ ['FR-009']]"/>
+            </when>
+        </choice>
+
+        <!-- FR-010: HIGH-RISK MCC - TEMPORARY TEST LIST -->
+        <choice doc:name="Evaluate FR-010">
+            <when expression="#[not vars.insufficientData and (['7995', '5967', '4829'] contains ((payload.mcc default '') as String))]">
+                <set-variable variableName="fraudScore"
+                    value="#[vars.fraudScore + 20]"/>
+                <set-variable variableName="ruleHits"
+                    value="#[vars.ruleHits ++ ['FR-010']]"/>
+            </when>
+        </choice>
+
+        <!-- CAP SCORE AT 100 -->
+        <set-variable variableName="finalScore"
+            value="#[min([vars.fraudScore, 100])]"
+            doc:name="Cap Fraud Score"/>
+
+        <!-- DETERMINE VERDICT -->
+        <set-variable variableName="verdict"
+            value="#[if (vars.insufficientData) 'REVIEW' else if (vars.finalScore >= 70) 'DECLINE' else if (vars.finalScore >= 30) 'REVIEW' else 'APPROVE']"
+            doc:name="Determine Verdict"/>
+
+        <!-- DETERMINE REASON -->
+        <set-variable variableName="reasonCode"
+            value="#[if (vars.insufficientData) 'INSUFFICIENT_DATA' else 'FRAUD_RULES_TRIGGERED']"
+            doc:name="Determine Reason Code"/>
+
+        <logger level="INFO"
+            message="Fraud Score: #[vars.finalScore], Verdict: #[vars.verdict], Rules: #[vars.ruleHits]"
+            doc:name="Log Fraud Verdict"/>
+
+        <!-- BUILD AND PUBLISH FRAUD ALERT -->
+        <choice doc:name="Publish Suspicious Transaction Alert">
+
+            <when expression="#[vars.verdict == 'REVIEW' or vars.verdict == 'DECLINE']">
+
+                <set-payload
+                    value="#[{
+                        eventType: 'FRAUD_ALERT',
+                        correlationId: payload.correlationId default '',
+                        transactionId: payload.transactionId,
+                        customerId: payload.customerId,
+                        verdict: vars.verdict,
+                        score: vars.finalScore,
+                        firedRules: vars.ruleHits,
+                        customerReasonCode: vars.reasonCode
+                    }]"
+                    doc:name="Build Fraud Alert"/>
+
+                <logger level="INFO"
+                    message="Publishing fraud alert: #[payload]"
+                    doc:name="Log Fraud Alert Before Publish"/>
+
+                <jms:publish
+                    config-ref="JMS_Config"
+                    destination="txn.alert.queue"
+                    doc:name="Publish Fraud Alert"/>
+
+                <logger level="WARN"
+                    message="Fraud alert published to txn.alert.queue"
+                    doc:name="Log Published Alert"/>
+
+            </when>
+
+            <otherwise>
+                <logger level="INFO"
+                    message="Transaction approved"
+                    doc:name="Log Approved Transaction"/>
+            </otherwise>
+
+        </choice>
+
+    </flow>
+
+</mule>
